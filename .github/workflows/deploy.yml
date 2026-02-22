@@ -1,0 +1,131 @@
+name: Deploy TV Dashboard
+
+# Builds the Docker image on every push to main, pushes to ghcr.io,
+# then deploys to the Hetzner VPS alongside the existing Coroot stack.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SSH_KEY_PATH: /tmp/vps_ssh_key
+
+jobs:
+  build-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        id: push
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| latest | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| digest | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: Deploy to VPS
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.VPS_SSH_KEY }}" > ${{ env.SSH_KEY_PATH }}
+          chmod 600 ${{ env.SSH_KEY_PATH }}
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload compose file
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            root@${{ secrets.VPS_HOST }} 'mkdir -p /opt/tvcentras'
+          scp -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            deploy/docker-compose.yml \
+            root@${{ secrets.VPS_HOST }}:/opt/tvcentras/docker-compose.yml
+
+      - name: Pull & restart
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            root@${{ secrets.VPS_HOST }} '
+              set -e
+              cd /opt/tvcentras
+              docker compose pull tvcentras
+              docker compose up -d tvcentras
+              echo "=== Container status ==="
+              docker compose ps tvcentras
+            '
+
+      - name: Ensure Caddy routes tv.beerpub.dev
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            root@${{ secrets.VPS_HOST }} '
+              CADDYFILE=/opt/coroot/Caddyfile
+              if ! grep -q "tv.beerpub.dev" "$CADDYFILE"; then
+                printf "\n\ntv.beerpub.dev {\n    reverse_proxy tvcentras:8080\n}\n" >> "$CADDYFILE"
+                docker compose -f /opt/coroot/docker-compose.yml exec -T caddy \
+                  caddy reload --config /etc/caddy/Caddyfile
+                echo "Caddy updated with tv.beerpub.dev"
+              else
+                echo "Caddy already has tv.beerpub.dev entry"
+              fi
+            '
+
+      - name: Health check
+        run: |
+          sleep 5
+          curl -sf --retry 5 --retry-delay 3 https://tv.beerpub.dev/health \
+            && echo "Health check passed" \
+            || echo "Warning: health check failed"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "### Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | https://tv.beerpub.dev |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ needs.build-push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ${{ env.SSH_KEY_PATH }}

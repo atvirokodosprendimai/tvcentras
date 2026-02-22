@@ -1,0 +1,19 @@
+name: tvcentras
+
+# Joins the existing Coroot stack network so Caddy can reach the container.
+# First-time setup: add tv.beerpub.dev block to /opt/coroot/Caddyfile
+# (the deploy workflow does this automatically on first run).
+
+networks:
+  coroot_default:
+    external: true
+
+services:
+  tvcentras:
+    image: ghcr.io/atvirokodosprendimai/tvcentras:latest
+    restart: always
+    pull_policy: always
+    expose:
+      - "8080"
+    networks:
+      - coroot_default
