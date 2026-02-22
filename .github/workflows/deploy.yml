@@ -95,20 +95,26 @@ jobs:
             '
 
       - name: Ensure DNS record for tv.beerpub.dev
-        if: ${{ secrets.CF_API_TOKEN != '' }}
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
+          if [[ -z "${CF_API_TOKEN}" ]]; then
+            echo "CF_API_TOKEN not set, skipping DNS provisioning"
+            exit 0
+          fi
+
           ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
           VPS_IP="91.99.74.36"
 
           # Check if record already exists
           existing=$(curl -sf \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
             "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('result',[])))") || existing=0
 
           if [[ "${existing}" == "0" ]]; then
             curl -sf -X POST \
-              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
               --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
