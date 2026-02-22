@@ -1,7 +1,10 @@
 name: Deploy TV Dashboard
 
 # Builds the Docker image on every push to main, pushes to ghcr.io,
-# then deploys to the Hetzner VPS alongside the existing Coroot stack.
+# then deploys to the tvcentras origin server (joined to wgmesh; edges
+# serve tv.beerpub.dev over TLS via WireGuard tunnel).
+#
+# One-time infra setup is handled by provision.yml.
 
 on:
   push:
@@ -11,7 +14,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  SSH_KEY_PATH: /tmp/vps_ssh_key
+  SSH_KEY_PATH: /tmp/tvcentras_ssh
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 jobs:
   build-push:
@@ -61,123 +65,49 @@ jobs:
           echo "| digest | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
 
   deploy:
-    name: Deploy to VPS
+    name: Deploy to origin
     needs: build-push
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup SSH
+      - name: Setup SSH key
         run: |
-          echo "${{ secrets.VPS_SSH_KEY }}" > ${{ env.SSH_KEY_PATH }}
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.CHIMNEY_SSH_KEY }}" > ${{ env.SSH_KEY_PATH }}
           chmod 600 ${{ env.SSH_KEY_PATH }}
-          mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Upload compose file
+      - name: Pull & restart on origin
         run: |
-          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
-            root@${{ secrets.VPS_HOST }} 'mkdir -p /opt/tvcentras'
-          scp -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
-            deploy/docker-compose.yml \
-            root@${{ secrets.VPS_HOST }}:/opt/tvcentras/docker-compose.yml
+          IP="${{ secrets.TVCENTRAS_ORIGIN_IP }}"
+          SSH="ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }} root@$IP"
 
-      - name: Pull & restart
-        run: |
-          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
-            root@${{ secrets.VPS_HOST }} '
-              set -e
-              cd /opt/tvcentras
-              docker compose pull tvcentras
-              docker compose up -d tvcentras
-              echo "=== Container status ==="
-              docker compose ps tvcentras
-            '
+          $SSH '
+            set -e
+            cd /opt/tvcentras
+            docker compose pull tvcentras
+            docker compose up -d tvcentras
+            echo "=== Status ==="
+            docker compose ps tvcentras
+          '
 
-      - name: Ensure DNS record for tv.beerpub.dev
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          if [[ -z "${CF_API_TOKEN}" ]]; then
-            echo "CF_API_TOKEN not set, skipping DNS provisioning"
-            exit 0
-          fi
-
-          ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
-          VPS_IP="91.99.74.36"
-
-          # The zone has a *.beerpub.dev wildcard → CF tunnel, so we need an
-          # explicit unproxied A record to override it (same pattern as
-          # table.beerpub.dev and chimney.beerpub.dev).
-          # Find any existing A record for tv.beerpub.dev and get its id/proxied state.
-          record=$(curl -sf \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
-            | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-r=d.get('result',[])
-if r: print(r[0]['id'], r[0]['proxied'], r[0]['content'])
-")
-
-          if [[ -z "${record}" ]]; then
-            # No A record — create unproxied one
-            curl -sf -X POST \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
-              --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
-            echo "DNS record created: tv.beerpub.dev → ${VPS_IP} (unproxied)"
-          else
-            REC_ID=$(echo "${record}" | awk '{print $1}')
-            REC_PROXIED=$(echo "${record}" | awk '{print $2}')
-            REC_IP=$(echo "${record}" | awk '{print $3}')
-            if [[ "${REC_PROXIED}" == "True" || "${REC_IP}" != "${VPS_IP}" ]]; then
-              # Wrong IP or proxied — update to unproxied direct
-              curl -sf -X PUT \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${REC_ID}" \
-                --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
-              echo "DNS record updated: tv.beerpub.dev → ${VPS_IP} (unproxied)"
-            else
-              echo "DNS record OK: tv.beerpub.dev → ${VPS_IP} (unproxied)"
-            fi
-          fi
-
-      - name: Ensure Caddy routes tv.beerpub.dev
-        run: |
-          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
-            root@${{ secrets.VPS_HOST }} '
-              CADDYFILE=/opt/coroot/Caddyfile
-              if ! grep -q "tv.beerpub.dev" "$CADDYFILE"; then
-                printf "\n\ntv.beerpub.dev {\n    reverse_proxy tvcentras:8080\n}\n" >> "$CADDYFILE"
-                docker compose -f /opt/coroot/docker-compose.yml exec -T caddy \
-                  caddy reload --config /etc/caddy/Caddyfile
-                echo "Caddy updated with tv.beerpub.dev"
-              else
-                echo "Caddy already has tv.beerpub.dev entry"
-              fi
-            '
-
-      - name: Health check
+      - name: Health check via edge
         run: |
           sleep 5
           curl -sf --retry 5 --retry-delay 3 https://tv.beerpub.dev/health \
             && echo "Health check passed" \
-            || echo "Warning: health check failed"
+            || echo "::warning::Health check failed"
 
       - name: Deployment summary
         if: success()
         run: |
-          echo "### Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployed to origin" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| URL | https://tv.beerpub.dev |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin | \`${{ secrets.TVCENTRAS_ORIGIN_IP }}\` (wgmesh, nbg1) |" >> $GITHUB_STEP_SUMMARY
           echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Digest | \`${{ needs.build-push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
 
-      - name: Cleanup SSH
+      - name: Cleanup SSH key
         if: always()
-        run: rm -f ${{ env.SSH_KEY_PATH }}
+        run: rm -f ${{ env.SSH_KEY_PATH }} || true
