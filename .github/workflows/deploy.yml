@@ -46,6 +46,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -92,6 +93,35 @@ jobs:
               echo "=== Container status ==="
               docker compose ps tvcentras
             '
+
+      - name: Ensure DNS record for tv.beerpub.dev
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          if [[ -z "${CF_API_TOKEN}" ]]; then
+            echo "CF_API_TOKEN not set, skipping DNS provisioning"
+            exit 0
+          fi
+
+          ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
+          VPS_IP="91.99.74.36"
+
+          # Check if record already exists
+          existing=$(curl -sf \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('result',[])))") || existing=0
+
+          if [[ "${existing}" == "0" ]]; then
+            curl -sf -X POST \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+              --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
+            echo "DNS record created: tv.beerpub.dev → ${VPS_IP}"
+          else
+            echo "DNS record already exists"
+          fi
 
       - name: Ensure Caddy routes tv.beerpub.dev
         run: |
