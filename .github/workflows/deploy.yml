@@ -106,21 +106,43 @@ jobs:
           ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
           VPS_IP="91.99.74.36"
 
-          # Check if record already exists
-          existing=$(curl -sf \
+          # The zone has a *.beerpub.dev wildcard → CF tunnel, so we need an
+          # explicit unproxied A record to override it (same pattern as
+          # table.beerpub.dev and chimney.beerpub.dev).
+          # Find any existing A record for tv.beerpub.dev and get its id/proxied state.
+          record=$(curl -sf \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('result',[])))") || existing=0
+            | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+r=d.get('result',[])
+if r: print(r[0]['id'], r[0]['proxied'], r[0]['content'])
+")
 
-          if [[ "${existing}" == "0" ]]; then
+          if [[ -z "${record}" ]]; then
+            # No A record — create unproxied one
             curl -sf -X POST \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
               --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
-            echo "DNS record created: tv.beerpub.dev → ${VPS_IP}"
+            echo "DNS record created: tv.beerpub.dev → ${VPS_IP} (unproxied)"
           else
-            echo "DNS record already exists"
+            REC_ID=$(echo "${record}" | awk '{print $1}')
+            REC_PROXIED=$(echo "${record}" | awk '{print $2}')
+            REC_IP=$(echo "${record}" | awk '{print $3}')
+            if [[ "${REC_PROXIED}" == "True" || "${REC_IP}" != "${VPS_IP}" ]]; then
+              # Wrong IP or proxied — update to unproxied direct
+              curl -sf -X PUT \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${REC_ID}" \
+                --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${VPS_IP}\",\"ttl\":1,\"proxied\":false}"
+              echo "DNS record updated: tv.beerpub.dev → ${VPS_IP} (unproxied)"
+            else
+              echo "DNS record OK: tv.beerpub.dev → ${VPS_IP} (unproxied)"
+            fi
           fi
 
       - name: Ensure Caddy routes tv.beerpub.dev
