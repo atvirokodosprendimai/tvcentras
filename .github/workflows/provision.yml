@@ -1,0 +1,406 @@
+name: Provision tvcentras origin
+
+# One-shot workflow: creates the Hetzner origin server, joins it to the
+# wgmesh, configures edge Caddy to route tv.beerpub.dev, and updates DNS.
+#
+# After provision, deploys run via deploy.yml (pull + restart over SSH).
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action"
+        required: true
+        type: choice
+        options:
+          - provision
+          - teardown
+          - status
+
+env:
+  HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+  SSH_KEY_PATH: /tmp/tvcentras_ssh
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+jobs:
+  run:
+    name: "Infra: ${{ inputs.action }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      secrets: write   # needed to store TVCENTRAS_ORIGIN_IP
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install hcloud CLI
+        run: |
+          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin hcloud
+          hcloud version
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.CHIMNEY_SSH_KEY }}" > ${{ env.SSH_KEY_PATH }}
+          chmod 600 ${{ env.SSH_KEY_PATH }}
+
+      # ──────────────── PROVISION ────────────────
+      - name: Provision tvcentras-origin
+        if: inputs.action == 'provision'
+        run: |
+          set -euo pipefail
+
+          if hcloud server describe tvcentras-origin &>/dev/null; then
+            IP=$(hcloud server ip tvcentras-origin)
+            echo "tvcentras-origin already exists: $IP"
+            echo "ORIGIN_IP=$IP" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          PUB_KEY="${{ secrets.CHIMNEY_SSH_PUBKEY }}"
+
+          # Minimal cloud-init: SSH key + Docker install.
+          # Files are pushed via SCP after server is reachable.
+          cat > /tmp/cloud-init.yaml <<YAML
+#cloud-config
+
+write_files:
+  - path: /root/.ssh/authorized_keys
+    content: |
+      ${PUB_KEY}
+    permissions: '0600'
+    owner: root:root
+  - path: /etc/ssh/sshd_config.d/90-tvcentras.conf
+    content: |
+      PermitRootLogin yes
+      AuthorizedKeysFile .ssh/authorized_keys
+    permissions: '0644'
+
+runcmd:
+  - mkdir -p /root/.ssh && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+  - systemctl restart sshd
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+YAML
+
+          hcloud server create \
+            --name tvcentras-origin \
+            --type cax11 \
+            --image ubuntu-24.04 \
+            --location nbg1 \
+            --user-data-from-file /tmp/cloud-init.yaml \
+            --label service=tvcentras \
+            --label role=origin \
+            --label arch=arm64
+
+          IP=$(hcloud server ip tvcentras-origin)
+          echo "Created tvcentras-origin: $IP"
+          echo "ORIGIN_IP=$IP" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH
+        if: inputs.action == 'provision'
+        run: |
+          IP="${{ env.ORIGIN_IP }}"
+          echo "Waiting for SSH on $IP..."
+          for i in $(seq 1 30); do
+            if ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }} \
+               -o ConnectTimeout=5 root@$IP echo ok 2>/dev/null | grep -q ok; then
+              echo "SSH ready after $((i * 10))s"
+              break
+            fi
+            [ $i -eq 30 ] && { echo "SSH timeout"; exit 1; }
+            echo "Attempt $i/30..."
+            sleep 10
+          done
+
+      - name: Bootstrap origin
+        if: inputs.action == 'provision'
+        run: |
+          IP="${{ env.ORIGIN_IP }}"
+          SCP="scp ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+          SSH="ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+
+          $SCP deploy/origin/compose.yml root@$IP:/tmp/compose.yml
+          $SCP deploy/origin/Caddyfile   root@$IP:/tmp/Caddyfile
+          $SCP deploy/origin/setup.sh    root@$IP:/tmp/setup.sh
+
+          $SSH root@$IP \
+            "WGMESH_SECRET='${{ secrets.WGMESH_SECRET }}' bash /tmp/setup.sh \
+             > /var/log/tvcentras-setup.log 2>&1" && echo "Bootstrap OK"
+
+      - name: Wait for wgmesh and get WireGuard IP
+        if: inputs.action == 'provision'
+        run: |
+          IP="${{ env.ORIGIN_IP }}"
+          echo "Waiting for wg0 interface (up to 5 min)..."
+          for i in $(seq 1 20); do
+            WG_IP=$(ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }} root@$IP \
+              "ip -4 addr show wg0 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1" \
+              2>/dev/null || echo "")
+            if [ -n "$WG_IP" ]; then
+              echo "WireGuard IP: $WG_IP"
+              echo "WG_IP=$WG_IP" >> "$GITHUB_ENV"
+              break
+            fi
+            echo "Waiting for mesh convergence ($i/20)..."
+            sleep 15
+          done
+          if [ -z "${WG_IP:-}" ]; then
+            echo "::error::wgmesh did not converge in time"
+            ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }} root@$IP \
+              "docker compose -f /opt/tvcentras/compose.yml logs wgmesh 2>&1 | tail -20" || true
+            exit 1
+          fi
+
+      - name: Push tv.beerpub.dev block to edge Caddy servers
+        if: inputs.action == 'provision'
+        run: |
+          WG_IP="${{ env.WG_IP }}"
+          SSH="ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+          SCP="scp ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+
+          # Write the Caddy site block with the actual WireGuard IP
+          cat > /tmp/tv-caddy-block.txt <<BLOCK
+
+tv.beerpub.dev {
+    encode gzip
+
+    log {
+        output stderr
+        format console
+        level INFO
+    }
+
+    tls {
+        protocols tls1.2 tls1.3
+    }
+
+    reverse_proxy {
+        to http://${WG_IP}:80
+
+        health_uri /health
+        health_interval 10s
+        health_timeout 5s
+        health_status 200
+
+        lb_policy round_robin
+
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+
+    header {
+        X-Served-By {system.hostname}
+        -Server
+    }
+}
+BLOCK
+
+          EDGES=$(hcloud server list -l "service=chimney,role=edge" \
+            -o noheader -o columns=name,ipv4 2>/dev/null)
+
+          if [ -z "$EDGES" ]; then
+            echo "::warning::No chimney edge servers found via Hetzner labels"
+            exit 0
+          fi
+
+          while read -r name ip; do
+            [ -z "$name" ] && continue
+            echo "=== Edge: $name ($ip) ==="
+
+            if $SSH root@$ip 'grep -q "tv.beerpub.dev" /opt/chimney/Caddyfile.edge 2>/dev/null'; then
+              echo "tv.beerpub.dev block already present — skipping"
+              continue
+            fi
+
+            $SCP /tmp/tv-caddy-block.txt root@$ip:/tmp/tv-caddy-block.txt
+            $SSH root@$ip 'cat /tmp/tv-caddy-block.txt >> /opt/chimney/Caddyfile.edge'
+
+            # Reload Caddy (bind-mounted file, just need a reload signal)
+            CADDY_ID=$($SSH root@$ip 'docker ps -qf "name=chimney-caddy" | head -1' 2>/dev/null || echo "")
+            if [ -n "$CADDY_ID" ]; then
+              $SSH root@$ip "docker exec $CADDY_ID caddy reload --config /etc/caddy/Caddyfile"
+              echo "Caddy reloaded on $name"
+            else
+              echo "::warning::Caddy container not found on $name"
+            fi
+          done <<< "$EDGES"
+
+      - name: Update DNS — tv.beerpub.dev → edge IPs
+        if: inputs.action == 'provision'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
+
+          # Remove old direct record pointing to the table VPS
+          OLD=$(curl -sf \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
+            | python3 -c "
+import sys,json
+for r in json.load(sys.stdin).get('result',[]):
+    if r['content'] == '91.99.74.36':
+        print(r['id'])
+" || echo "")
+
+          if [ -n "$OLD" ]; then
+            curl -sf -X DELETE \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${OLD}"
+            echo "Removed A record → 91.99.74.36 (table VPS)"
+          fi
+
+          # Add unproxied A record for each edge server IP
+          EDGE_IPS=$(hcloud server list -l "service=chimney,role=edge" \
+            -o noheader -o columns=ipv4 2>/dev/null)
+
+          for ip in $EDGE_IPS; do
+            existing=$(curl -sf \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
+              | python3 -c "
+import sys,json
+rs=[r for r in json.load(sys.stdin).get('result',[]) if r['content']=='$ip']
+print(len(rs))" || echo 0)
+
+            if [ "$existing" = "0" ]; then
+              curl -sf -X POST \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+                --data "{\"type\":\"A\",\"name\":\"tv\",\"content\":\"${ip}\",\"ttl\":1,\"proxied\":false}"
+              echo "DNS: tv.beerpub.dev → $ip (unproxied)"
+            else
+              echo "DNS: tv.beerpub.dev → $ip already exists"
+            fi
+          done
+
+      - name: Store origin IP as repo secret
+        if: inputs.action == 'provision'
+        env:
+          GH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+        run: |
+          IP="${{ env.ORIGIN_IP }}"
+          printf '%s' "$IP" | gh secret set TVCENTRAS_ORIGIN_IP \
+            --repo atvirokodosprendimai/tvcentras
+          echo "TVCENTRAS_ORIGIN_IP=$IP stored as repo secret"
+
+      - name: Clean up old table VPS deployment
+        if: inputs.action == 'provision'
+        run: |
+          VPS="91.99.74.36"
+          SSH="ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+
+          echo "Removing tvcentras from table VPS..."
+          $SSH root@$VPS '
+            set -e
+            cd /opt/tvcentras 2>/dev/null || exit 0
+
+            docker compose down 2>/dev/null || true
+
+            # Remove Caddy entry
+            if grep -q "tv.beerpub.dev" /opt/coroot/Caddyfile 2>/dev/null; then
+              # Remove the tv.beerpub.dev block (3 lines)
+              sed -i "/tv.beerpub.dev/,/^}/d" /opt/coroot/Caddyfile
+              docker compose -f /opt/coroot/docker-compose.yml exec -T caddy \
+                caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+              echo "Caddyfile cleaned on table VPS"
+            fi
+          ' && echo "Table VPS cleanup done" || echo "::warning::Table VPS cleanup failed (may not be reachable)"
+
+      - name: Health check
+        if: inputs.action == 'provision'
+        run: |
+          echo "Waiting 30s for edge TLS cert to issue..."
+          sleep 30
+          curl -sf --retry 6 --retry-delay 10 https://tv.beerpub.dev/health \
+            && echo "tv.beerpub.dev is live via edge" \
+            || echo "::warning::Health check failed — TLS cert may still be issuing"
+
+      - name: Provision summary
+        if: inputs.action == 'provision' && success()
+        run: |
+          echo "### tvcentras origin provisioned" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin server | tvcentras-origin (nbg1, cax11, arm64) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin IP | \`${{ env.ORIGIN_IP }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| WireGuard IP | \`${{ env.WG_IP }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | https://tv.beerpub.dev |" >> $GITHUB_STEP_SUMMARY
+
+      # ──────────────── STATUS ────────────────
+      - name: Status
+        if: inputs.action == 'status'
+        run: |
+          echo "## tvcentras Fleet" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          hcloud server list -l "service=tvcentras" \
+            -o columns=name,status,ipv4,datacenter,labels >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          hcloud server list -l "service=tvcentras" -o columns=name,status,ipv4,datacenter
+
+          IP=$(hcloud server ip tvcentras-origin 2>/dev/null || echo "")
+          if [ -n "$IP" ]; then
+            if ssh ${{ env.SSH_OPTS }} -o ConnectTimeout=5 \
+               -i ${{ env.SSH_KEY_PATH }} root@$IP echo ok 2>/dev/null | grep -q ok; then
+              echo "SSH: OK"
+              ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }} root@$IP \
+                'docker compose -f /opt/tvcentras/compose.yml ps 2>/dev/null || true'
+            fi
+          fi
+
+      # ──────────────── TEARDOWN ────────────────
+      - name: Teardown
+        if: inputs.action == 'teardown'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          ZONE_ID="99dd7fb187fb6f0d08127a7899b92bed"
+          SSH="ssh ${{ env.SSH_OPTS }} -i ${{ env.SSH_KEY_PATH }}"
+
+          # Remove tv.beerpub.dev from edge Caddy
+          EDGES=$(hcloud server list -l "service=chimney,role=edge" \
+            -o noheader -o columns=name,ipv4 2>/dev/null) || true
+          while read -r name ip; do
+            [ -z "$name" ] && continue
+            echo "Cleaning edge $name..."
+            $SSH root@$ip '
+              sed -i "/^tv\.beerpub\.dev/,/^}/d" /opt/chimney/Caddyfile.edge 2>/dev/null || true
+              CADDY_ID=$(docker ps -qf "name=chimney-caddy" | head -1)
+              [ -n "$CADDY_ID" ] && docker exec $CADDY_ID caddy reload --config /etc/caddy/Caddyfile || true
+            ' || true
+          done <<< "$EDGES"
+
+          # Remove DNS records pointing to edge IPs
+          EDGE_IPS=$(hcloud server list -l "service=chimney,role=edge" \
+            -o noheader -o columns=ipv4 2>/dev/null) || true
+          for ip in $EDGE_IPS; do
+            REC_ID=$(curl -sf \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=tv.beerpub.dev" \
+              | python3 -c "
+import sys,json
+for r in json.load(sys.stdin).get('result',[]):
+    if r['content']=='$ip': print(r['id'])
+" || echo "")
+            [ -n "$REC_ID" ] && curl -sf -X DELETE \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${REC_ID}" \
+              && echo "Removed DNS: tv.beerpub.dev → $ip" || true
+          done
+
+          # Delete origin server
+          if hcloud server describe tvcentras-origin &>/dev/null; then
+            hcloud server delete tvcentras-origin
+            echo "tvcentras-origin deleted"
+          fi
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ${{ env.SSH_KEY_PATH }} || true

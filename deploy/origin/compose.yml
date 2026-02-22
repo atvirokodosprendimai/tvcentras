@@ -1,0 +1,59 @@
+# tvcentras origin server
+#
+# Three services:
+#   wgmesh    — joins the shared WireGuard mesh (host network, NET_ADMIN)
+#   tvcentras — Go dashboard, bound to localhost:8080 only
+#   caddy     — HTTP-only reverse proxy (host network, auto_https off)
+#               listens on :80 of all interfaces including the WG IP,
+#               so edge Caddy can reach it over the mesh
+#
+# Pattern mirrors chimney origin: app on 127.0.0.1 port, Caddy on host
+# network proxies to it. TLS lives on the edge servers only.
+
+name: tvcentras
+
+volumes:
+  caddy_data:
+  caddy_config:
+  wgmesh_state:
+
+services:
+
+  wgmesh:
+    image: ghcr.io/atvirokodosprendimai/wgmesh:latest
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - wgmesh_state:/var/lib/wgmesh
+      - /lib/modules:/lib/modules:ro
+    environment:
+      WGMESH_SECRET: ${WGMESH_SECRET:-}
+    command:
+      - join
+      - --secret=${WGMESH_SECRET:-}
+
+  tvcentras:
+    image: ghcr.io/atvirokodosprendimai/tvcentras:latest
+    restart: always
+    pull_policy: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - tvcentras

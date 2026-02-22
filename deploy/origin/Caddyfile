@@ -1,0 +1,22 @@
+# Origin Caddyfile for tvcentras.
+#
+# auto_https off: origins are only reached from edge Caddy via WireGuard
+# (plain HTTP on :80). TLS terminates on the edges, not here.
+# Enabling auto_https would cause 308 redirects that break edge health checks.
+
+{
+    admin localhost:2019
+    auto_https off
+}
+
+:80 {
+    encode gzip
+
+    log {
+        output stderr
+        format console
+        level INFO
+    }
+
+    reverse_proxy localhost:8080
+}
